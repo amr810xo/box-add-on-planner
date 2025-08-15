@@ -35,6 +35,8 @@ def default_catalog() -> Dict[str, Item]:
         "truffle box": Item("truffle box", 8.50, 4.00, 2.00, True),
         "matcha satchet": Item("matcha satchet", 5.00, 3.00, 0.10, True),
         "4 oz bottle": Item("4 oz bottle", 2.09, 2.09, 4.81, True),
+        # New item
+        "Ice pack": Item("Ice pack", 11.00, 8.00, 1.75, True),
     }
 
 # Angela's current counts (preloaded)
@@ -45,11 +47,12 @@ DEFAULT_COUNTS = {
     "truffle box": 1,
     "matcha satchet": 1,
     "4 oz bottle": 5,
+    "Ice pack": 0,  # New
 }
 
 BOX_PRESETS = {
-    "Big 13×13×9.5": Box(13.0, 13.0, 9.5),
-    "Small 10×8×11.5": Box(10.0, 8.0, 11.5),
+    "Big 19.875×16.875×11.875": Box(19.875, 16.875, 11.875),
+    "Small 16×10×13": Box(16.0, 10.0, 13.0),
     "Custom": None,
 }
 
@@ -75,7 +78,7 @@ class Layer:
     def __init__(self, box_L: float, box_W: float):
         self.box_L = box_L
         self.box_W = box_W
-        self.items: List[Tuple[str, float, float, float]] = []  # (name, L, W, H)
+        self.items: List[Tuple[str, float, float, float]] = []
         self.height: float = 0.0
         self.placement: Optional[List[Tuple[float, float, float, float]]] = None
 
@@ -182,14 +185,14 @@ def layout_table(layers: List[Layer]) -> List[Dict]:
 # UI
 # -------------------------
 st.title("📦 Box Add-On Fit Planner")
-st.caption("Preloaded with Angela's items and two box presets. Adjust as needed.")
+st.caption("Preloaded with Angela's items and updated box presets.")
 
 # --- Box presets ---
 st.sidebar.header("Box Preset")
 preset = st.sidebar.selectbox("Choose box", options=list(BOX_PRESETS.keys()), index=0)
 
 if "box_dims" not in st.session_state:
-    st.session_state.box_dims = (BOX_PRESETS["Big 13×13×9.5"].L, BOX_PRESETS["Big 13×13×9.5"].W, BOX_PRESETS["Big 13×13×9.5"].H)
+    st.session_state.box_dims = (BOX_PRESETS["Big 19.875×16.875×11.875"].L, BOX_PRESETS["Big 19.875×16.875×11.875"].W, BOX_PRESETS["Big 19.875×16.875×11.875"].H)
 
 if preset != "Custom":
     b = BOX_PRESETS[preset]
@@ -214,7 +217,7 @@ for name in list(cat.keys()):
 
 # --- What it comes with ---
 st.subheader("1) What it comes with")
-st.write("Enter the **base items** included in the order. (Preloaded with your current combo.)")
+st.write("Enter the **base items** included in the order.")
 
 counts = {}
 cols = st.columns(3)
@@ -241,16 +244,16 @@ st.divider()
 
 # --- What can add on ---
 st.subheader("2) What can add on")
-st.write("Pick add-on types to try and set per-type caps. We'll search for combos that **still fit** on top of the base.")
+st.write("Pick add-on types to try and set per-type caps.")
 
-candidate_types = st.multiselect("Add-on candidates", options=names, default=["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento"])
+candidate_types = st.multiselect("Add-on candidates", options=names, default=["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento", "Ice pack"])
 caps = {}
 cap_cols = st.columns(5)
 for i, name in enumerate(candidate_types):
     default_cap = 4 if name != "matcha satchet" else 20
     caps[name] = cap_cols[i % 5].number_input(f"Max extra {name}", min_value=0, value=default_cap, step=1, key=f"cap_{name}")
 
-trials = st.slider("Search permutations", min_value=5, max_value=200, value=50, step=5, help="More permutations = more variety (slower).")
+trials = st.slider("Search permutations", min_value=5, max_value=200, value=50, step=5)
 
 if st.button("Find add-on combos 🎯"):
     base_items = expand_items(cat, counts)
@@ -259,9 +262,9 @@ if st.button("Find add-on combos 🎯"):
         st.warning("Your base ('comes with') does not fit yet. Reduce items, then try add-ons.")
     res = greedy_addon_search(counts, candidate_types, caps, cat, box, trials=trials, seed=123)
     if not res:
-        st.info("No add-on combos found under the current caps that still fit.")
+        st.info("No add-on combos found.")
     else:
-        st.success(f"Found {len(res)} add-on combo(s). Top results:")
+        st.success(f"Found {len(res)} add-on combo(s).")
         table_rows = []
         for i, (extras, total_added, layers, h, final_counts) in enumerate(res, start=1):
             table_rows.append({
@@ -272,11 +275,10 @@ if st.button("Find add-on combos 🎯"):
                 "Add-ons": ", ".join([f"{k}×{v}" for k,v in extras.items() if v>0]) if any(v>0 for v in extras.values()) else "—"
             })
         st.dataframe(table_rows, use_container_width=True)
-        st.caption("Pick an option index to view its layer breakdown (base + add-ons).")
-        opt_idx = st.number_input("Option to preview", min_value=1, max_value=len(res), value=1, step=1, key="opt_idx")
+        opt_idx = st.number_input("Option to preview", min_value=1, max_value=len(res), value=1, step=1)
         extras, total_added, layers, h, final_counts = res[opt_idx-1]
-        st.markdown(f"**Selected option {opt_idx}** → height used **{h:.2f} in** / layers **{len(layers)}**. Final counts: `" + json.dumps(final_counts) + "`.")
+        st.markdown(f"**Selected option {opt_idx}** → height used **{h:.2f} in** / layers **{len(layers)}**.")
         st.dataframe(layout_table(layers), use_container_width=True)
 
 st.divider()
-st.caption("Estimator only. Real-world packing may require protective materials and orientation constraints not modeled here.")
+st.caption("Estimator only — real-world packing may require protective materials.")
