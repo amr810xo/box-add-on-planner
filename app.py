@@ -13,10 +13,10 @@ st.set_page_config(page_title="Box Add-On Fit Planner", page_icon="📦", layout
 @dataclass
 class Item:
     name: str
-    L: float  # inches
-    W: float  # inches
-    H: float  # inches (stacking height)
-    rotatable_xy: bool = True
+    L: float  # inches (footprint length)
+    W: float  # inches (footprint width)
+    H: float  # inches (stacking height / thickness)
+    rotatable_xy: bool = True  # rotation only matters for L/W
 
 @dataclass
 class Box:
@@ -25,9 +25,9 @@ class Box:
     H: float
 
 # -------------------------
-# Defaults (editable in UI)
+# Static defaults (base catalog without liners)
 # -------------------------
-def default_catalog() -> Dict[str, Item]:
+def base_catalog() -> Dict[str, Item]:
     return {
         "16 oz jar": Item("16 oz jar", 3.39, 3.39, 4.52, True),
         "24 oz jar": Item("24 oz jar", 3.38, 3.38, 6.17, True),
@@ -35,8 +35,7 @@ def default_catalog() -> Dict[str, Item]:
         "truffle box": Item("truffle box", 8.50, 4.00, 2.00, True),
         "matcha satchet": Item("matcha satchet", 5.00, 3.00, 0.10, True),
         "4 oz bottle": Item("4 oz bottle", 2.09, 2.09, 4.81, True),
-        # New item
-        "Ice pack": Item("Ice pack", 11.00, 8.00, 1.75, True),
+        "Ice pack": Item("Ice pack", 11.00, 8.00, 1.75, True),  # NEW
     }
 
 # Angela's current counts (preloaded)
@@ -47,9 +46,13 @@ DEFAULT_COUNTS = {
     "truffle box": 1,
     "matcha satchet": 1,
     "4 oz bottle": 5,
-    "Ice pack": 0,  # New
+    "Ice pack": 0,
+    # Liners default to 0 so you can choose bottom/top/etc.
+    "A liner": 0,
+    "B liner": 0,
 }
 
+# Updated presets
 BOX_PRESETS = {
     "Big 19.875×16.875×11.875": Box(19.875, 16.875, 11.875),
     "Small 16×10×13": Box(16.0, 10.0, 13.0),
@@ -60,6 +63,7 @@ BOX_PRESETS = {
 # Packing helpers (2D per layer using rectpack)
 # -------------------------
 def pack_rectangles(rects: List[Tuple[float, float]], bin_size: Tuple[float, float]) -> Optional[List[Tuple[float, float, float, float]]]:
+    """Pack rectangles (w,h) into bin (W,H). Returns placements or None if any didn’t fit."""
     if not rects:
         return []
     packer = newPacker(rotation=True)
@@ -78,7 +82,7 @@ class Layer:
     def __init__(self, box_L: float, box_W: float):
         self.box_L = box_L
         self.box_W = box_W
-        self.items: List[Tuple[str, float, float, float]] = []
+        self.items: List[Tuple[str, float, float, float]] = []  # (name, L, W, H)
         self.height: float = 0.0
         self.placement: Optional[List[Tuple[float, float, float, float]]] = None
 
@@ -103,9 +107,11 @@ class Layer:
         }
 
 def try_pack_all(items_expanded: List[Item], box: Box) -> Tuple[bool, List[Layer], float]:
+    """Greedy: tallest-first stacking into layers until fit or fail."""
     layers: List[Layer] = []
     for it in sorted(items_expanded, key=lambda x: (-x.H, max(x.L, x.W))):
         placed = False
+        # place into layer with most free area first
         for layer in sorted(layers, key=lambda L: L.summary()["free_area"], reverse=True):
             if layer.try_add(it):
                 placed = True
@@ -185,28 +191,47 @@ def layout_table(layers: List[Layer]) -> List[Dict]:
 # UI
 # -------------------------
 st.title("📦 Box Add-On Fit Planner")
-st.caption("Preloaded with Angela's items and updated box presets.")
+st.caption("Preloaded with updated box presets. Liners auto-size to your selected box.")
 
 # --- Box presets ---
 st.sidebar.header("Box Preset")
 preset = st.sidebar.selectbox("Choose box", options=list(BOX_PRESETS.keys()), index=0)
 
+# Keep a session copy of dims so the number_inputs reflect the preset
 if "box_dims" not in st.session_state:
-    st.session_state.box_dims = (BOX_PRESETS["Big 19.875×16.875×11.875"].L, BOX_PRESETS["Big 19.875×16.875×11.875"].W, BOX_PRESETS["Big 19.875×16.875×11.875"].H)
+    st.session_state.box_dims = (BOX_PRESETS["Big 19.875×16.875×11.875"].L,
+                                 BOX_PRESETS["Big 19.875×16.875×11.875"].W,
+                                 BOX_PRESETS["Big 19.875×16.875×11.875"].H)
 
 if preset != "Custom":
     b = BOX_PRESETS[preset]
     st.session_state.box_dims = (b.L, b.W, b.H)
 
 st.sidebar.header("Box Dimensions (in)")
-L = st.sidebar.number_input("Length", value=float(st.session_state.box_dims[0]), min_value=0.1, step=0.1, format="%.2f", key="L_input")
-W = st.sidebar.number_input("Width",  value=float(st.session_state.box_dims[1]), min_value=0.1, step=0.1, format="%.2f", key="W_input")
-H = st.sidebar.number_input("Height", value=float(st.session_state.box_dims[2]), min_value=0.1, step=0.1, format="%.2f", key="H_input")
+L = st.sidebar.number_input("Length", value=float(st.session_state.box_dims[0]), min_value=0.1, step=0.1, format="%.3f", key="L_input")
+W = st.sidebar.number_input("Width",  value=float(st.session_state.box_dims[1]), min_value=0.1, step=0.1, format="%.3f", key="W_input")
+H = st.sidebar.number_input("Height", value=float(st.session_state.box_dims[2]), min_value=0.1, step=0.1, format="%.3f", key="H_input")
 box = Box(L, W, H)
 
-# --- Catalog editor ---
+# --- Liners (auto-sized to box footprint) ---
+st.sidebar.header("Liners (thickness in inches)")
+tA = st.sidebar.number_input("A liner thickness", min_value=0.0, value=0.0, step=0.01, format="%.3f", help="Set >0 to enable the A liner item.")
+tB = st.sidebar.number_input("B liner thickness", min_value=0.0, value=0.0, step=0.01, format="%.3f", help="Set >0 to enable the B liner item.")
+
+# --- Catalog (dynamic: base items + auto-sized liners) ---
+def build_catalog(current_box: Box, thickness_A: float, thickness_B: float) -> Dict[str, Item]:
+    cat = base_catalog()
+    # Add liners sized to the current box footprint (LxW). Height is thickness.
+    if thickness_A and thickness_A > 0:
+        cat["A liner"] = Item("A liner", current_box.L, current_box.W, thickness_A, False)
+    if thickness_B and thickness_B > 0:
+        cat["B liner"] = Item("B liner", current_box.L, current_box.W, thickness_B, False)
+    return cat
+
 st.sidebar.header("Catalog (edit if needed)")
-cat = default_catalog()
+cat = build_catalog(box, tA, tB)
+
+# per-item editors
 for name in list(cat.keys()):
     with st.sidebar.expander(name, expanded=False):
         col1, col2, col3 = st.columns(3)
@@ -217,14 +242,14 @@ for name in list(cat.keys()):
 
 # --- What it comes with ---
 st.subheader("1) What it comes with")
-st.write("Enter the **base items** included in the order.")
+st.write("Enter the **base items** included in the order. (Liners: set counts if using bottom/top/etc.)")
 
-counts = {}
+counts: Dict[str, int] = {}
 cols = st.columns(3)
-names = list(default_catalog().keys())
+names = list(cat.keys())  # Use dynamic catalog including liners
 for idx, name in enumerate(names):
-    default_val = DEFAULT_COUNTS.get(name, 0)
-    counts[name] = cols[idx % 3].number_input(f"{name}", min_value=0, value=int(default_val), step=1, key=f"qty_{name}")
+    default_val = int(DEFAULT_COUNTS.get(name, 0))
+    counts[name] = cols[idx % 3].number_input(f"{name}", min_value=0, value=default_val, step=1, key=f"qty_{name}")
 
 if st.button("Check 'comes with' fit ✅", type="primary"):
     items = expand_items(cat, counts)
@@ -233,10 +258,10 @@ if st.button("Check 'comes with' fit ✅", type="primary"):
         st.success(f"Fits! Estimated stacked height: **{height_used:.2f} in** of **{box.H:.2f} in**. Layers: {len(layers)}.")
     else:
         if math.isinf(height_used):
-            st.error(f"Does not fit in the {box.L}×{box.W} footprint.")
+            st.error(f"Does not fit in the {box.L:.2f}×{box.W:.2f} footprint.")
         else:
             st.error(f"Does not fit. Estimated stacked height needed: **{height_used:.2f} in** > box height **{box.H:.2f} in**.")
-    if layers:
+    if 'layers' in locals() and layers:
         st.markdown("**Layer breakdown (base items)**")
         st.dataframe(layout_table(layers), use_container_width=True)
 
@@ -244,16 +269,24 @@ st.divider()
 
 # --- What can add on ---
 st.subheader("2) What can add on")
-st.write("Pick add-on types to try and set per-type caps.")
+st.write("Pick add-on types to try and set per-type caps. (You can also include liners here if you want to try a top liner in add-ons.)")
 
-candidate_types = st.multiselect("Add-on candidates", options=names, default=["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento", "Ice pack"])
-caps = {}
+candidate_types = st.multiselect(
+    "Add-on candidates",
+    options=names,
+    default=[n for n in ["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento", "Ice pack", "A liner", "B liner"] if n in names],
+)
+caps: Dict[str, int] = {}
 cap_cols = st.columns(5)
 for i, name in enumerate(candidate_types):
-    default_cap = 4 if name != "matcha satchet" else 20
+    # Provide generous default caps; you can dial them down as needed
+    default_cap = 20 if "satchet" in name.lower() else 4
+    # Liners typically 0–2 (bottom/top), so set 2 by default if present
+    if "liner" in name.lower():
+        default_cap = 2
     caps[name] = cap_cols[i % 5].number_input(f"Max extra {name}", min_value=0, value=default_cap, step=1, key=f"cap_{name}")
 
-trials = st.slider("Search permutations", min_value=5, max_value=200, value=50, step=5)
+trials = st.slider("Search permutations", min_value=5, max_value=200, value=50, step=5, help="More permutations = more variety (slower).")
 
 if st.button("Find add-on combos 🎯"):
     base_items = expand_items(cat, counts)
@@ -262,9 +295,9 @@ if st.button("Find add-on combos 🎯"):
         st.warning("Your base ('comes with') does not fit yet. Reduce items, then try add-ons.")
     res = greedy_addon_search(counts, candidate_types, caps, cat, box, trials=trials, seed=123)
     if not res:
-        st.info("No add-on combos found.")
+        st.info("No add-on combos found under the current caps that still fit.")
     else:
-        st.success(f"Found {len(res)} add-on combo(s).")
+        st.success(f"Found {len(res)} add-on combo(s). Top results:")
         table_rows = []
         for i, (extras, total_added, layers, h, final_counts) in enumerate(res, start=1):
             table_rows.append({
@@ -275,10 +308,11 @@ if st.button("Find add-on combos 🎯"):
                 "Add-ons": ", ".join([f"{k}×{v}" for k,v in extras.items() if v>0]) if any(v>0 for v in extras.values()) else "—"
             })
         st.dataframe(table_rows, use_container_width=True)
-        opt_idx = st.number_input("Option to preview", min_value=1, max_value=len(res), value=1, step=1)
+        st.caption("Pick an option index to view its layer breakdown (base + add-ons).")
+        opt_idx = st.number_input("Option to preview", min_value=1, max_value=len(res), value=1, step=1, key="opt_idx")
         extras, total_added, layers, h, final_counts = res[opt_idx-1]
-        st.markdown(f"**Selected option {opt_idx}** → height used **{h:.2f} in** / layers **{len(layers)}**.")
+        st.markdown(f"**Selected option {opt_idx}** → height used **{h:.2f} in** / layers **{len(layers)}**. Final counts: `" + json.dumps(final_counts) + "`.")
         st.dataframe(layout_table(layers), use_container_width=True)
 
 st.divider()
-st.caption("Estimator only — real-world packing may require protective materials.")
+st.caption("Estimator only. Real-world packing may require protective materials and orientation constraints not modeled here.")
