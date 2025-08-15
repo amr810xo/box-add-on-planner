@@ -7,16 +7,16 @@ import json
 
 st.set_page_config(page_title="Box Add-On Fit Planner", page_icon="📦", layout="wide")
 
-# -------------------------
+# =========================
 # Data models
-# -------------------------
+# =========================
 @dataclass
 class Item:
     name: str
     L: float  # inches (footprint length)
     W: float  # inches (footprint width)
-    H: float  # inches (stacking height / thickness)
-    rotatable_xy: bool = True  # rotation only matters for L/W
+    H: float  # inches (stacking height)
+    rotatable_xy: bool = True  # rotation matters for L/W rectangles
 
 @dataclass
 class Box:
@@ -24,9 +24,9 @@ class Box:
     W: float
     H: float
 
-# -------------------------
-# Static defaults (base catalog without liners)
-# -------------------------
+# =========================
+# Catalog (only real products; liners/ice are modeled via interior shrink)
+# =========================
 def base_catalog() -> Dict[str, Item]:
     return {
         "16 oz jar": Item("16 oz jar", 3.39, 3.39, 4.52, True),
@@ -35,10 +35,12 @@ def base_catalog() -> Dict[str, Item]:
         "truffle box": Item("truffle box", 8.50, 4.00, 2.00, True),
         "matcha satchet": Item("matcha satchet", 5.00, 3.00, 0.10, True),
         "4 oz bottle": Item("4 oz bottle", 2.09, 2.09, 4.81, True),
-        "Ice pack": Item("Ice pack", 11.00, 8.00, 1.75, True),  # NEW
+        # Ice is not an item anymore—it's modeled as width shrink.
+        # If you want to experiment with EXTRA ice as real items, you could add:
+        # "Extra ice pack": Item("Extra ice pack", 11.00, 8.00, 1.75, True),
     }
 
-# Angela's current counts (preloaded)
+# Preloaded counts for "What it comes with" (edit to match your base program)
 DEFAULT_COUNTS = {
     "16 oz jar": 3,
     "24 oz jar": 0,
@@ -46,22 +48,30 @@ DEFAULT_COUNTS = {
     "truffle box": 1,
     "matcha satchet": 1,
     "4 oz bottle": 5,
-    "Ice pack": 0,
-    # Liners default to 0 so you can choose bottom/top/etc.
-    "A liner": 0,
-    "B liner": 0,
 }
 
-# Updated presets
+# =========================
+# Presets
+# =========================
 BOX_PRESETS = {
     "Big 19.875×16.875×11.875": Box(19.875, 16.875, 11.875),
     "Small 16×10×13": Box(16.0, 10.0, 13.0),
     "Custom": None,
 }
 
-# -------------------------
-# Packing helpers (2D per layer using rectpack)
-# -------------------------
+# Liner default thickness by preset (inches)
+LINER_THICKNESS_DEFAULTS = {
+    "Big 19.875×16.875×11.875": {"A": 1.75, "B": 1.75},
+    "Small 16×10×13": {"A": 0.00, "B": 0.00},  # fill when you know them
+    "Custom": {"A": 0.00, "B": 0.00},
+}
+
+# Default side-ice thickness (each upright pack "eats" this from width)
+ICE_SIDE_THICKNESS_DEFAULT = 1.75
+
+# =========================
+# Packing helpers
+# =========================
 def pack_rectangles(rects: List[Tuple[float, float]], bin_size: Tuple[float, float]) -> Optional[List[Tuple[float, float, float, float]]]:
     """Pack rectangles (w,h) into bin (W,H). Returns placements or None if any didn’t fit."""
     if not rects:
@@ -70,7 +80,8 @@ def pack_rectangles(rects: List[Tuple[float, float]], bin_size: Tuple[float, flo
     binW, binH = bin_size  # rectpack uses (width, height)
     packer.add_bin(binW, binH)
     for i, (w, h) in enumerate(rects):
-        packer.add_rect(w, h, rid=i)
+        # Guard against 0 which rectpack doesn’t like
+        packer.add_rect(max(w, 1e-6), max(h, 1e-6), rid=i)
     packer.pack()
     all_rects = packer.rect_list()
     if len(all_rects) < len(rects):
@@ -107,11 +118,10 @@ class Layer:
         }
 
 def try_pack_all(items_expanded: List[Item], box: Box) -> Tuple[bool, List[Layer], float]:
-    """Greedy: tallest-first stacking into layers until fit or fail."""
+    """Greedy stacking by tallest-first into layers until fit or fail."""
     layers: List[Layer] = []
     for it in sorted(items_expanded, key=lambda x: (-x.H, max(x.L, x.W))):
         placed = False
-        # place into layer with most free area first
         for layer in sorted(layers, key=lambda L: L.summary()["free_area"], reverse=True):
             if layer.try_add(it):
                 placed = True
@@ -133,7 +143,8 @@ def expand_items(catalog: Dict[str, Item], counts: Dict[str, int]) -> List[Item]
         out.extend([item] * int(n))
     return out
 
-def greedy_addon_search(base_counts: Dict[str, int], candidates: List[str], max_add_per: Dict[str, int], catalog: Dict[str, Item], box: Box, trials:int=50, seed:int=42):
+def greedy_addon_search(base_counts: Dict[str, int], candidates: List[str], max_add_per: Dict[str, int],
+                        catalog: Dict[str, Item], box: Box, trials:int=50, seed:int=42):
     import random
     rng = random.Random(seed)
     results = []
@@ -148,14 +159,14 @@ def greedy_addon_search(base_counts: Dict[str, int], candidates: List[str], max_
             cap = max_add_per.get(name, 0)
             for _ in range(cap):
                 test_counts = dict(counts)
-                test_counts[name] = test_counts.get(name,0) + 1
+                test_counts[name] = test_counts.get(name, 0) + 1
                 items = expand_items(catalog, test_counts)
                 ok, layers, h = try_pack_all(items, box)
                 if ok:
                     counts = test_counts
                 else:
                     break
-        extras = {k: counts.get(k,0) - base_counts.get(k,0) for k in set(list(counts.keys())+list(base_counts.keys()))}
+        extras = {k: counts.get(k, 0) - base_counts.get(k, 0) for k in set(list(counts.keys()) + list(base_counts.keys()))}
         total_added = sum(max(0, v) for v in extras.values())
         items = expand_items(catalog, counts)
         ok, layers, h = try_pack_all(items, box)
@@ -187,66 +198,102 @@ def layout_table(layers: List[Layer]) -> List[Dict]:
         })
     return rows
 
-# -------------------------
+# =========================
 # UI
-# -------------------------
+# =========================
 st.title("📦 Box Add-On Fit Planner")
-st.caption("Preloaded with updated box presets. Liners auto-size to your selected box.")
+st.caption("Ice = width-only; liners shrink all faces. Liners can squish (compression factor).")
 
-# --- Box presets ---
+# --- Box preset & dimensions ---
 st.sidebar.header("Box Preset")
 preset = st.sidebar.selectbox("Choose box", options=list(BOX_PRESETS.keys()), index=0)
 
-# Keep a session copy of dims so the number_inputs reflect the preset
 if "box_dims" not in st.session_state:
     st.session_state.box_dims = (BOX_PRESETS["Big 19.875×16.875×11.875"].L,
                                  BOX_PRESETS["Big 19.875×16.875×11.875"].W,
                                  BOX_PRESETS["Big 19.875×16.875×11.875"].H)
-
 if preset != "Custom":
     b = BOX_PRESETS[preset]
     st.session_state.box_dims = (b.L, b.W, b.H)
 
 st.sidebar.header("Box Dimensions (in)")
-L = st.sidebar.number_input("Length", value=float(st.session_state.box_dims[0]), min_value=0.1, step=0.1, format="%.3f", key="L_input")
-W = st.sidebar.number_input("Width",  value=float(st.session_state.box_dims[1]), min_value=0.1, step=0.1, format="%.3f", key="W_input")
-H = st.sidebar.number_input("Height", value=float(st.session_state.box_dims[2]), min_value=0.1, step=0.1, format="%.3f", key="H_input")
-box = Box(L, W, H)
+raw_L = st.sidebar.number_input("Length", value=float(st.session_state.box_dims[0]), min_value=0.1, step=0.1, format="%.3f")
+raw_W = st.sidebar.number_input("Width",  value=float(st.session_state.box_dims[1]), min_value=0.1, step=0.1, format="%.3f")
+raw_H = st.sidebar.number_input("Height", value=float(st.session_state.box_dims[2]), min_value=0.1, step=0.1, format="%.3f")
 
-# --- Liners (auto-sized to box footprint) ---
-st.sidebar.header("Liners (thickness in inches)")
-tA = st.sidebar.number_input("A liner thickness", min_value=0.0, value=0.0, step=0.01, format="%.3f", help="Set >0 to enable the A liner item.")
-tB = st.sidebar.number_input("B liner thickness", min_value=0.0, value=0.0, step=0.01, format="%.3f", help="Set >0 to enable the B liner item.")
+# --- Liners (A/B): thickness + where they apply + squish ---
+st.sidebar.header("Liners")
+defaults = LINER_THICKNESS_DEFAULTS.get(preset, LINER_THICKNESS_DEFAULTS["Custom"])
+tA = st.sidebar.number_input("A liner thickness (in)", min_value=0.0, value=float(defaults["A"]), step=0.01, format="%.3f")
+sA = st.sidebar.slider("A liner squish (0–50%)", min_value=0, max_value=50, value=50, step=5, help="Percent compression; 50% means it can compress to half height/side.")
+tB = st.sidebar.number_input("B liner thickness (in)", min_value=0.0, value=float(defaults["B"]), step=0.01, format="%.3f")
+sB = st.sidebar.slider("B liner squish (0–50%)", min_value=0, max_value=50, value=50, step=5)
 
-# --- Catalog (dynamic: base items + auto-sized liners) ---
-def build_catalog(current_box: Box, thickness_A: float, thickness_B: float) -> Dict[str, Item]:
-    cat = base_catalog()
-    # Add liners sized to the current box footprint (LxW). Height is thickness.
-    if thickness_A and thickness_A > 0:
-        cat["A liner"] = Item("A liner", current_box.L, current_box.W, thickness_A, False)
-    if thickness_B and thickness_B > 0:
-        cat["B liner"] = Item("B liner", current_box.L, current_box.W, thickness_B, False)
-    return cat
+with st.sidebar.expander("Where A liner applies", expanded=False):
+    A_sides  = st.checkbox("Left/Right (sides)", value=True,  key="A_sides")
+    A_top    = st.checkbox("Top",               value=False, key="A_top")
+    A_bottom = st.checkbox("Bottom",            value=True,  key="A_bottom")
 
+with st.sidebar.expander("Where B liner applies", expanded=False):
+    B_sides  = st.checkbox("Left/Right (sides)", value=True, key="B_sides")
+    B_top    = st.checkbox("Top",                value=True, key="B_top")
+    B_bottom = st.checkbox("Bottom",             value=False,key="B_bottom")
+
+# Compute effective (squished) thickness
+tA_eff = tA * (1 - sA/100.0)
+tB_eff = tB * (1 - sB/100.0)
+
+# --- Ice: width-only spacer (two upright packs on opposite sides) ---
+st.sidebar.header("Ice")
+use_ice = st.sidebar.checkbox("Include side ice", value=True)
+ice_side_thick = st.sidebar.number_input("Ice thickness per side (in)", min_value=0.0, value=ICE_SIDE_THICKNESS_DEFAULT, step=0.05, format="%.2f")
+
+# ---- Compute effective interior after liners + ice ----
+# Sides: subtract 2 * (sum of liners applying to sides) from BOTH L and W
+side_sum = (tA_eff if A_sides else 0.0) + (tB_eff if B_sides else 0.0)
+eff_L = max(0.1, raw_L - 2.0 * side_sum)
+eff_W = max(0.1, raw_W - 2.0 * side_sum)
+
+# Ice reduces WIDTH only (two sides)
+if use_ice and ice_side_thick > 0:
+    eff_W = max(0.1, eff_W - 2.0 * ice_side_thick)
+
+# Top/Bottom: subtract per face from HEIGHT
+eff_H = max(0.1,
+    raw_H
+    - (tA_eff if A_top else 0.0)
+    - (tB_eff if B_top else 0.0)
+    - (tA_eff if A_bottom else 0.0)
+    - (tB_eff if B_bottom else 0.0)
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Effective interior (after liners + ice):**")
+st.sidebar.markdown(f"**{eff_L:.3f} × {eff_W:.3f} × {eff_H:.3f} in**")
+
+# Use effective interior for packing
+box = Box(eff_L, eff_W, eff_H)
+
+# --- Catalog (edit if needed) ---
 st.sidebar.header("Catalog (edit if needed)")
-cat = build_catalog(box, tA, tB)
-
-# per-item editors
+cat = base_catalog()
 for name in list(cat.keys()):
     with st.sidebar.expander(name, expanded=False):
-        col1, col2, col3 = st.columns(3)
-        cat[name].L = col1.number_input(f"{name} — L", value=cat[name].L, step=0.01, format="%.2f", key=f"L_{name}")
-        cat[name].W = col2.number_input(f"{name} — W", value=cat[name].W, step=0.01, format="%.2f", key=f"W_{name}")
-        cat[name].H = col3.number_input(f"{name} — H", value=cat[name].H, step=0.01, format="%.2f", key=f"H_{name}")
+        c1, c2, c3 = st.columns(3)
+        cat[name].L = c1.number_input(f"{name} — L", value=cat[name].L, step=0.01, format="%.2f", key=f"L_{name}")
+        cat[name].W = c2.number_input(f"{name} — W", value=cat[name].W, step=0.01, format="%.2f", key=f"W_{name}")
+        cat[name].H = c3.number_input(f"{name} — H", value=cat[name].H, step=0.01, format="%.2f", key=f"H_{name}")
         cat[name].rotatable_xy = st.checkbox("Allow L×W rotation", value=True, key=f"rot_{name}")
 
-# --- What it comes with ---
+# =========================
+# 1) What it comes with
+# =========================
 st.subheader("1) What it comes with")
-st.write("Enter the **base items** included in the order. (Liners: set counts if using bottom/top/etc.)")
+st.write("Enter the **base items** included in the order. (Ice/liners are already accounted for via interior shrink.)")
 
 counts: Dict[str, int] = {}
 cols = st.columns(3)
-names = list(cat.keys())  # Use dynamic catalog including liners
+names = list(cat.keys())
 for idx, name in enumerate(names):
     default_val = int(DEFAULT_COUNTS.get(name, 0))
     counts[name] = cols[idx % 3].number_input(f"{name}", min_value=0, value=default_val, step=1, key=f"qty_{name}")
@@ -255,7 +302,7 @@ if st.button("Check 'comes with' fit ✅", type="primary"):
     items = expand_items(cat, counts)
     ok, layers, height_used = try_pack_all(items, box)
     if ok:
-        st.success(f"Fits! Estimated stacked height: **{height_used:.2f} in** of **{box.H:.2f} in**. Layers: {len(layers)}.")
+        st.success(f"Fits! Base uses **{height_used:.2f} in** of **{box.H:.2f} in** → headroom **{box.H - height_used:.2f} in**. Layers: {len(layers)}.")
     else:
         if math.isinf(height_used):
             st.error(f"Does not fit in the {box.L:.2f}×{box.W:.2f} footprint.")
@@ -267,23 +314,21 @@ if st.button("Check 'comes with' fit ✅", type="primary"):
 
 st.divider()
 
-# --- What can add on ---
+# =========================
+# 2) What can add on
+# =========================
 st.subheader("2) What can add on")
-st.write("Pick add-on types to try and set per-type caps. (You can also include liners here if you want to try a top liner in add-ons.)")
+st.write("Pick add-on types to try and set per-type caps. (Ice/liners are not items—they’re built into the interior.)")
 
 candidate_types = st.multiselect(
     "Add-on candidates",
     options=names,
-    default=[n for n in ["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento", "Ice pack", "A liner", "B liner"] if n in names],
+    default=[n for n in ["16 oz jar", "4 oz bottle", "matcha satchet", "truffle box", "35 oz bento"] if n in names],
 )
 caps: Dict[str, int] = {}
 cap_cols = st.columns(5)
 for i, name in enumerate(candidate_types):
-    # Provide generous default caps; you can dial them down as needed
     default_cap = 20 if "satchet" in name.lower() else 4
-    # Liners typically 0–2 (bottom/top), so set 2 by default if present
-    if "liner" in name.lower():
-        default_cap = 2
     caps[name] = cap_cols[i % 5].number_input(f"Max extra {name}", min_value=0, value=default_cap, step=1, key=f"cap_{name}")
 
 trials = st.slider("Search permutations", min_value=5, max_value=200, value=50, step=5, help="More permutations = more variety (slower).")
