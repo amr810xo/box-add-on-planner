@@ -13,10 +13,11 @@ st.set_page_config(page_title="Box Add-On Fit Planner", page_icon="📦", layout
 @dataclass
 class Item:
     name: str
-    L: float  # inches (footprint length)
-    W: float  # inches (footprint width)
-    H: float  # inches (stacking height)
-    rotatable_xy: bool = True  # rotation matters for L/W rectangles
+    L: float  # inches (footprint length when flat)
+    W: float  # inches (footprint width when flat)
+    H: float  # inches (stacking height when flat)
+    rotatable_xy: bool = True         # allow swapping L <-> W (flat rotate)
+    allow_standing: bool = False      # allow using H as a footprint dimension
 
 @dataclass
 class Box:
@@ -25,19 +26,17 @@ class Box:
     H: float
 
 # =========================
-# Catalog (only real products; liners/ice are modeled via interior shrink)
+# Catalog (real products only; liners/ice modeled via interior shrink)
 # =========================
 def base_catalog() -> Dict[str, Item]:
     return {
         "16 oz jar": Item("16 oz jar", 3.39, 3.39, 4.52, True),
         "24 oz jar": Item("24 oz jar", 3.38, 3.38, 6.17, True),
         "35 oz bento": Item("35 oz bento", 8.04, 5.39, 2.85, True),
-        "truffle box": Item("truffle box", 8.50, 4.00, 2.00, True),
+        "truffle box": Item("truffle box", 8.50, 4.00, 2.00, True, False),  # standing can be enabled in UI
         "matcha satchet": Item("matcha satchet", 5.00, 3.00, 0.10, True),
         "4 oz bottle": Item("4 oz bottle", 2.09, 2.09, 4.81, True),
-        # Ice is not an item anymore—it's modeled as width shrink.
-        # If you want to experiment with EXTRA ice as real items, you could add:
-        # "Extra ice pack": Item("Extra ice pack", 11.00, 8.00, 1.75, True),
+        # NOTE: Ice is not an item anymore—it's handled as width shrink from the box interior.
     }
 
 # Preloaded counts for "What it comes with" (edit to match your base program)
@@ -67,7 +66,7 @@ LINER_THICKNESS_DEFAULTS = {
 }
 
 # Default side-ice thickness (each upright pack "eats" this from width)
-ICE_SIDE_THICKNESS_DEFAULT = 1.75
+ICE_SIDE_THICKNESS_DEFAULT = 1.75  # each side
 
 # =========================
 # Packing helpers
@@ -76,11 +75,11 @@ def pack_rectangles(rects: List[Tuple[float, float]], bin_size: Tuple[float, flo
     """Pack rectangles (w,h) into bin (W,H). Returns placements or None if any didn’t fit."""
     if not rects:
         return []
-    packer = newPacker(rotation=True)
+    packer = newPacker(rotation=False)  # we explicitly enumerate rotations/orientations ourselves
     binW, binH = bin_size  # rectpack uses (width, height)
     packer.add_bin(binW, binH)
     for i, (w, h) in enumerate(rects):
-        # Guard against 0 which rectpack doesn’t like
+        # Guard against zeros which rectpack doesn’t like
         packer.add_rect(max(w, 1e-6), max(h, 1e-6), rid=i)
     packer.pack()
     all_rects = packer.rect_list()
@@ -89,26 +88,58 @@ def pack_rectangles(rects: List[Tuple[float, float]], bin_size: Tuple[float, flo
     placed = sorted([(x, y, w, h) for (_, x, y, w, h, rid) in all_rects], key=lambda t: (t[1], t[0]))
     return placed
 
+def enumerate_orientations(it: Item) -> List[Tuple[float, float, float]]:
+    """
+    Return a list of possible (footprint_w, footprint_h, stack_height) for an item.
+    - Always include flat orientations: (L,W,H) and, if rotatable_xy, (W,L,H)
+    - If allow_standing: include orientations where H is in the footprint and L or W becomes the stack height.
+      We include:
+        (L,H,W), (H,L,W), (W,H,L), (H,W,L)
+      (Some may be redundant; harmless.)
+    """
+    variants = [(it.L, it.W, it.H)]
+    if it.rotatable_xy:
+        variants.append((it.W, it.L, it.H))
+    if it.allow_standing:
+        variants.extend([
+            (it.L, it.H, it.W),
+            (it.H, it.L, it.W),
+            (it.W, it.H, it.L),
+            (it.H, it.W, it.L),
+        ])
+    # Deduplicate near-equal tuples
+    out = []
+    seen = set()
+    for w,h,zh in variants:
+        key = (round(w,4), round(h,4), round(zh,4))
+        if key not in seen:
+            seen.add(key)
+            out.append((w,h,zh))
+    return out
+
 class Layer:
     def __init__(self, box_L: float, box_W: float):
         self.box_L = box_L
         self.box_W = box_W
-        self.items: List[Tuple[str, float, float, float]] = []  # (name, L, W, H)
+        # store items as (name, foot_w, foot_h, stack_h)
+        self.items: List[Tuple[str, float, float, float]] = []
         self.height: float = 0.0
         self.placement: Optional[List[Tuple[float, float, float, float]]] = None
 
     def try_add(self, item: Item) -> bool:
-        candidate_rects = [(it[1], it[2]) for it in self.items] + [(item.L, item.W)]
-        placed = pack_rectangles(candidate_rects, (self.box_L, self.box_W))
-        if placed is None:
-            return False
-        self.items.append((item.name, item.L, item.W, item.H))
-        self.placement = placed
-        self.height = max(self.height, item.H)
-        return True
+        # Try all allowed orientations and accept the first that fits
+        for (w_new, h_new, z_new) in enumerate_orientations(item):
+            candidate_rects = [(it[1], it[2]) for it in self.items] + [(w_new, h_new)]
+            placed = pack_rectangles(candidate_rects, (self.box_L, self.box_W))
+            if placed is not None:
+                self.items.append((item.name, w_new, h_new, z_new))
+                self.placement = placed
+                self.height = max(self.height, z_new)
+                return True
+        return False
 
     def summary(self) -> Dict:
-        area_used = sum(w*h for (_,_,w,h) in [(0,0,it[1],it[2]) for it in self.items])
+        area_used = sum(w*h for (_, w, h, _) in self.items)
         return {
             "items": [name for (name, _, _, _) in self.items],
             "height": self.height,
@@ -120,8 +151,10 @@ class Layer:
 def try_pack_all(items_expanded: List[Item], box: Box) -> Tuple[bool, List[Layer], float]:
     """Greedy stacking by tallest-first into layers until fit or fail."""
     layers: List[Layer] = []
+    # Sort tallest-first (by each item's *flat* H; standing option handled in try_add)
     for it in sorted(items_expanded, key=lambda x: (-x.H, max(x.L, x.W))):
         placed = False
+        # Try placing into the layer with the most free area first
         for layer in sorted(layers, key=lambda L: L.summary()["free_area"], reverse=True):
             if layer.try_add(it):
                 placed = True
@@ -202,7 +235,7 @@ def layout_table(layers: List[Layer]) -> List[Dict]:
 # UI
 # =========================
 st.title("📦 Box Add-On Fit Planner")
-st.caption("Ice = width-only; liners shrink all faces. Liners can squish (compression factor).")
+st.caption("Ice shrinks width; liners shrink all faces with squish. Truffle box can stand up if enabled.")
 
 # --- Box preset & dimensions ---
 st.sidebar.header("Box Preset")
@@ -225,7 +258,7 @@ raw_H = st.sidebar.number_input("Height", value=float(st.session_state.box_dims[
 st.sidebar.header("Liners")
 defaults = LINER_THICKNESS_DEFAULTS.get(preset, LINER_THICKNESS_DEFAULTS["Custom"])
 tA = st.sidebar.number_input("A liner thickness (in)", min_value=0.0, value=float(defaults["A"]), step=0.01, format="%.3f")
-sA = st.sidebar.slider("A liner squish (0–50%)", min_value=0, max_value=50, value=50, step=5, help="Percent compression; 50% means it can compress to half height/side.")
+sA = st.sidebar.slider("A liner squish (0–50%)", min_value=0, max_value=50, value=50, step=5, help="Percent compression; 50% = half thickness.")
 tB = st.sidebar.number_input("B liner thickness (in)", min_value=0.0, value=float(defaults["B"]), step=0.01, format="%.3f")
 sB = st.sidebar.slider("B liner squish (0–50%)", min_value=0, max_value=50, value=50, step=5)
 
@@ -243,13 +276,13 @@ with st.sidebar.expander("Where B liner applies", expanded=False):
 tA_eff = tA * (1 - sA/100.0)
 tB_eff = tB * (1 - sB/100.0)
 
-# --- Ice: width-only spacer (two upright packs on opposite sides) ---
+# --- Ice: width-only shrink (two upright packs on opposite sides) ---
 st.sidebar.header("Ice")
 use_ice = st.sidebar.checkbox("Include side ice", value=True)
 ice_side_thick = st.sidebar.number_input("Ice thickness per side (in)", min_value=0.0, value=ICE_SIDE_THICKNESS_DEFAULT, step=0.05, format="%.2f")
 
 # ---- Compute effective interior after liners + ice ----
-# Sides: subtract 2 * (sum of liners applying to sides) from BOTH L and W
+# For liners on sides: shrink BOTH L and W by 2 * (sum of side-applied effective thickness)
 side_sum = (tA_eff if A_sides else 0.0) + (tB_eff if B_sides else 0.0)
 eff_L = max(0.1, raw_L - 2.0 * side_sum)
 eff_W = max(0.1, raw_W - 2.0 * side_sum)
@@ -258,7 +291,7 @@ eff_W = max(0.1, raw_W - 2.0 * side_sum)
 if use_ice and ice_side_thick > 0:
     eff_W = max(0.1, eff_W - 2.0 * ice_side_thick)
 
-# Top/Bottom: subtract per face from HEIGHT
+# Top/Bottom liners reduce HEIGHT
 eff_H = max(0.1,
     raw_H
     - (tA_eff if A_top else 0.0)
@@ -283,13 +316,16 @@ for name in list(cat.keys()):
         cat[name].L = c1.number_input(f"{name} — L", value=cat[name].L, step=0.01, format="%.2f", key=f"L_{name}")
         cat[name].W = c2.number_input(f"{name} — W", value=cat[name].W, step=0.01, format="%.2f", key=f"W_{name}")
         cat[name].H = c3.number_input(f"{name} — H", value=cat[name].H, step=0.01, format="%.2f", key=f"H_{name}")
-        cat[name].rotatable_xy = st.checkbox("Allow L×W rotation", value=True, key=f"rot_{name}")
+        cat[name].rotatable_xy = st.checkbox("Allow L×W rotation", value=cat[name].rotatable_xy, key=f"rot_{name}")
+        # Only show "Allow standing" for truffle box (per your request)
+        if name == "truffle box":
+            cat[name].allow_standing = st.checkbox("Allow standing (use height as footprint)", value=False, key="stand_truffle")
 
 # =========================
 # 1) What it comes with
 # =========================
 st.subheader("1) What it comes with")
-st.write("Enter the **base items** included in the order. (Ice/liners are already accounted for via interior shrink.)")
+st.write("Enter the **base items** included in the order. (Ice/liners already accounted for via interior shrink.)")
 
 counts: Dict[str, int] = {}
 cols = st.columns(3)
